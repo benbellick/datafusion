@@ -732,12 +732,11 @@ fn add_roundrobin_on_top(
     }
 }
 
-// Partial aggregates require unspecified input distribution, but their output
-// may already satisfy the final aggregate's key distribution because partial
-// aggregation preserves/projects input partitioning. Keep that reusable output
-// partitioning intact when preserve_file_partitions would otherwise insert
-// RoundRobin below the partial aggregate.
-fn partial_aggregate_output_satisfies_final_partitioning(
+// Partial aggregates require unspecified input distribution, but their input
+// may already keep every group partition-local. Preserve that layout when
+// preserve_file_partitions would otherwise insert RoundRobin below the partial
+// aggregate, and reuse it for the final aggregate.
+fn partial_aggregate_has_partition_local_groups(
     plan: &Arc<dyn ExecutionPlan>,
     allow_subset_satisfy_partitioning: bool,
 ) -> bool {
@@ -751,15 +750,54 @@ fn partial_aggregate_output_satisfies_final_partitioning(
         return false;
     }
 
-    let key_distribution = Distribution::KeyPartitioned(aggregate.output_group_expr());
-
-    plan.output_partitioning()
+    let output_distribution = Distribution::KeyPartitioned(aggregate.output_group_expr());
+    if plan
+        .output_partitioning()
         .satisfaction(
-            &key_distribution,
+            &output_distribution,
             plan.equivalence_properties(),
             allow_subset_satisfy_partitioning,
         )
         .is_satisfied()
+    {
+        return true;
+    }
+
+    let input_distribution =
+        Distribution::KeyPartitioned(aggregate.group_expr().input_exprs());
+    aggregate
+        .input()
+        .output_partitioning()
+        .satisfaction(
+            &input_distribution,
+            aggregate.input().equivalence_properties(),
+            allow_subset_satisfy_partitioning,
+        )
+        .is_key_local()
+}
+
+fn final_aggregate_accepts_partition_local_groups(
+    final_aggregate: &Arc<dyn ExecutionPlan>,
+    child: &Arc<dyn ExecutionPlan>,
+    allow_subset_satisfy_partitioning: bool,
+) -> bool {
+    let Some(final_aggregate) = final_aggregate.downcast_ref::<AggregateExec>() else {
+        return false;
+    };
+    let Some(partial_aggregate) = child.downcast_ref::<AggregateExec>() else {
+        return false;
+    };
+
+    final_aggregate.mode() == &AggregateMode::FinalPartitioned
+        && !final_aggregate.group_expr().has_grouping_set()
+        && physical_exprs_equal(
+            &partial_aggregate.output_group_expr(),
+            &final_aggregate.group_expr().input_exprs(),
+        )
+        && partial_aggregate_has_partition_local_groups(
+            child,
+            allow_subset_satisfy_partitioning,
+        )
 }
 
 /// Adds a [`SortPreservingMergeExec`] or a [`CoalescePartitionsExec`] operator
@@ -1527,7 +1565,7 @@ pub fn ensure_distribution_with_stats(
 
             let preserve_partial_aggregate_partitioning =
                 preserve_file_partition_threshold_met
-                    && partial_aggregate_output_satisfies_final_partitioning(
+                    && partial_aggregate_has_partition_local_groups(
                         &plan,
                         allow_subset_satisfy_partitioning,
                     );
@@ -1570,7 +1608,12 @@ pub fn ensure_distribution_with_stats(
                             ChildSatisfactionOptions::new()
                                 .with_allow_subset(allow_subset_satisfy_partitioning),
                         )?
-                        .is_satisfied();
+                        .is_satisfied()
+                        || final_aggregate_accepts_partition_local_groups(
+                            &plan,
+                            &child.plan,
+                            allow_subset_satisfy_partitioning,
+                        );
                     let preserve_satisfying_file_partitioning =
                         preserve_file_partition_threshold_met
                             && !requires_grouping_id
