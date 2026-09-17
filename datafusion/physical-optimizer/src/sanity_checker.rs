@@ -30,7 +30,7 @@ use datafusion_common::config::{ConfigOptions, OptimizerOptions};
 use datafusion_common::plan_err;
 use datafusion_common::tree_node::{TreeNode, TreeNodeRecursion};
 use datafusion_physical_expr::intervals::utils::{check_support, is_datatype_supported};
-use datafusion_physical_plan::aggregates::{AggregateExec, AggregateMode};
+use datafusion_physical_plan::aggregates::AggregateExec;
 use datafusion_physical_plan::execution_plan::{
     Boundedness, EmissionType, InvariantLevel,
 };
@@ -176,9 +176,7 @@ pub fn check_plan_sanity(
         let accepts_partition_local_groups = plan
             .downcast_ref::<AggregateExec>()
             .is_some_and(|aggregate| {
-                aggregate.mode() == &AggregateMode::SinglePartitioned
-                    && !aggregate.group_expr().has_grouping_set()
-                    && distribution_satisfaction.is_key_local()
+                aggregate.groups_are_partition_local(child.as_ref(), true)
             });
         if !distribution_satisfaction.is_satisfied() && !accepts_partition_local_groups {
             let plan_str = get_plan_string(plan);

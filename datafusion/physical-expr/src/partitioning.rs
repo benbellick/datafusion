@@ -421,42 +421,39 @@ fn evaluate_with_range_value(
     }
 }
 
-fn projected_split_points(
+/// For a nondecreasing, null-preserving transform, adjacent partition images
+/// are disjoint when the values immediately across each split remain distinct.
+/// The open side is below an ASC split and above a DESC split.
+fn range_transform_keeps_groups_local(
     function: &Arc<dyn PhysicalExpr>,
     range_key: &Arc<dyn PhysicalExpr>,
     range: &RangePartitioning,
     key_index: usize,
     schema: &Schema,
-) -> Option<Vec<SplitPoint>> {
+) -> Option<()> {
     let range_type = range_key.data_type(schema).ok()?;
-    range
-        .split_points()
-        .iter()
-        .map(|split_point| {
-            let split_value = split_point.values().get(key_index)?;
-            if split_value.data_type() != range_type {
-                return None;
-            }
-            let adjacent = if range.ordering()[key_index].options.descending {
-                checked_successor(split_value)
-            } else {
-                checked_predecessor(split_value)
-            }?;
-            let at_split = evaluate_with_range_value(function, range_key, split_value)?;
-            let across_split = evaluate_with_range_value(function, range_key, &adjacent)?;
-            if at_split.is_null()
-                || across_split.is_null()
-                || at_split.data_type() != across_split.data_type()
-                || at_split == across_split
-            {
-                return None;
-            }
+    range.split_points().iter().try_for_each(|split_point| {
+        let split_value = split_point.values().get(key_index)?;
+        if split_value.data_type() != range_type {
+            return None;
+        }
+        let adjacent = if range.ordering()[key_index].options.descending {
+            checked_successor(split_value)
+        } else {
+            checked_predecessor(split_value)
+        }?;
+        let at_split = evaluate_with_range_value(function, range_key, split_value)?;
+        let across_split = evaluate_with_range_value(function, range_key, &adjacent)?;
+        if at_split.is_null()
+            || across_split.is_null()
+            || at_split.data_type() != across_split.data_type()
+            || at_split == across_split
+        {
+            return None;
+        }
 
-            let mut values = split_point.values().to_vec();
-            values[key_index] = at_split;
-            Some(SplitPoint::new(values))
-        })
-        .collect()
+        Some(())
+    })
 }
 
 fn is_audited_range_transform(
@@ -470,31 +467,29 @@ fn is_audited_range_transform(
         return false;
     };
     let schema = eq_properties.schema();
-    if !function
-        .supports_range_partitioning_analysis(schema)
-        .unwrap_or(false)
+    if datafusion_physical_expr_common::physical_expr::is_volatile(candidate)
+        || !function
+            .supports_range_partitioning_analysis(schema)
+            .unwrap_or(false)
         || !eq_properties.is_same_direction_ordered_transform(candidate, range_key)
     {
         return false;
     }
 
     let mut range_argument_count = 0;
-    let dummy_batch = create_dummy_batch().ok();
     for argument in function.args() {
         if equivalent_expr(argument, range_key, eq_properties) {
             range_argument_count += 1;
-        } else if dummy_batch
-            .as_ref()
-            .and_then(|batch| argument.evaluate(batch).ok())
-            .is_none_or(|value| !matches!(value, ColumnarValue::Scalar(_)))
-        {
+        } else if !argument.is::<Literal>() {
             return false;
         }
     }
 
     range_argument_count == 1
-        && projected_split_points(candidate, range_key, range, key_index, schema)
-            .is_some()
+        && range_transform_keeps_groups_local(
+            candidate, range_key, range, key_index, schema,
+        )
+        .is_some()
 }
 
 fn range_transform_satisfaction(
@@ -1194,6 +1189,172 @@ mod tests {
             value,
             timezone.map(Into::into),
         )])
+    }
+
+    fn assert_date_trunc_partition_images<T: arrow::array::types::ArrowTimestampType>()
+    -> Result<()> {
+        use arrow::array::{PrimitiveArray, RecordBatch};
+        use datafusion_common::HashSet;
+
+        let ticks_per_second = match T::UNIT {
+            TimeUnit::Second => 1,
+            TimeUnit::Millisecond => 1_000,
+            TimeUnit::Microsecond => 1_000_000,
+            TimeUnit::Nanosecond => 1_000_000_000,
+        };
+        let hour = 3600 * ticks_per_second;
+        let data_type = DataType::Timestamp(T::UNIT, None);
+        let schema =
+            Arc::new(Schema::new(vec![Field::new("ts", data_type.clone(), true)]));
+        let timestamp: Arc<dyn PhysicalExpr> = Arc::new(Column::new("ts", 0));
+        let properties = EquivalenceProperties::new(Arc::clone(&schema));
+
+        let mut cases = vec![
+            ("hour", false, vec![-hour, 0, hour], true),
+            ("hour", false, vec![-hour + 1, 1, hour + 1], false),
+            ("day", false, vec![-hour, 0, hour], false),
+            ("hour", true, vec![-hour, 0, hour], false),
+            ("hour", true, vec![-hour - 1, -1, hour - 1], true),
+        ];
+        for (precision, divisor) in [("millisecond", 1_000), ("microsecond", 1_000_000)] {
+            let width = (ticks_per_second / divisor).max(1);
+            cases.extend([
+                (precision, false, vec![-width, 0, width], true),
+                // In particular, microsecond input with millisecond precision
+                // must reject split -999: both adjacent array values map to -1000.
+                (precision, false, vec![-width + 1], width == 1),
+                (precision, true, vec![-width, 0, width], width == 1),
+                (precision, true, vec![-width - 1, -1, width - 1], true),
+            ]);
+        }
+        for (precision, descending, source_splits, expect_disjoint) in cases {
+            for nulls_first in [false, true] {
+                let options = SortOptions::new(descending, nulls_first);
+                let mut splits = source_splits.clone();
+                if descending {
+                    splits.reverse();
+                }
+                let range = Partitioning::Range(RangePartitioning::try_new(
+                    [PhysicalSortExpr::new(Arc::clone(&timestamp), options)].into(),
+                    splits
+                        .iter()
+                        .map(|value| {
+                            SplitPoint::new(vec![ScalarValue::new_timestamp::<T>(
+                                Some(*value),
+                                None,
+                            )])
+                        })
+                        .collect(),
+                )?);
+                let function: Arc<dyn PhysicalExpr> = Arc::new(ScalarFunctionExpr::new(
+                    "date_trunc",
+                    datafusion_functions::datetime::date_trunc(),
+                    vec![
+                        Arc::new(Literal::new(ScalarValue::from(precision))),
+                        Arc::clone(&timestamp),
+                    ],
+                    Field::new("bucket", data_type.clone(), true).into(),
+                    Arc::new(ConfigOptions::default()),
+                ));
+                let required = Distribution::KeyPartitioned(vec![Arc::clone(&function)]);
+                assert_eq!(
+                    range
+                        .satisfaction(&required, &properties, false)
+                        .is_key_local(),
+                    expect_disjoint
+                );
+
+                // Assign rows by source-domain comparisons, independently of
+                // the optimizer's adjacency check, then evaluate whole arrays.
+                let mut partitions = vec![vec![]; splits.len() + 1];
+                let rows = splits
+                    .iter()
+                    .flat_map(|split| [Some(split - 1), Some(*split), Some(split + 1)])
+                    .chain([None, None]);
+                for value in rows {
+                    let index = match value {
+                        None if nulls_first => 0,
+                        None => splits.len(),
+                        Some(value) => splits
+                            .iter()
+                            .filter(|split| {
+                                if descending {
+                                    value <= **split
+                                } else {
+                                    value >= **split
+                                }
+                            })
+                            .count(),
+                    };
+                    partitions[index].push(value);
+                }
+                let images = partitions
+                    .into_iter()
+                    .map(|values| {
+                        let input = Arc::new(PrimitiveArray::<T>::from_iter(values));
+                        let batch =
+                            RecordBatch::try_new(Arc::clone(&schema), vec![input])?;
+                        let output =
+                            function.evaluate(&batch)?.into_array(batch.num_rows())?;
+                        (0..output.len())
+                            .map(|i| ScalarValue::try_from_array(&output, i))
+                            .collect::<Result<HashSet<_>>>()
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                let disjoint = images.iter().enumerate().all(|(i, left)| {
+                    images
+                        .iter()
+                        .skip(i + 1)
+                        .all(|right| left.is_disjoint(right))
+                });
+                assert_eq!(
+                    disjoint,
+                    expect_disjoint,
+                    "{precision}, {:?}, {options:?}, splits={splits:?}",
+                    T::UNIT
+                );
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn date_trunc_partition_images_are_disjoint_only_for_safe_splits() -> Result<()> {
+        use arrow::array::types::{
+            TimestampMicrosecondType, TimestampMillisecondType, TimestampNanosecondType,
+            TimestampSecondType,
+        };
+        assert_date_trunc_partition_images::<TimestampSecondType>()?;
+        assert_date_trunc_partition_images::<TimestampMillisecondType>()?;
+        assert_date_trunc_partition_images::<TimestampMicrosecondType>()?;
+        assert_date_trunc_partition_images::<TimestampNanosecondType>()
+    }
+
+    #[test]
+    fn range_transform_requires_literal_parameters() -> Result<()> {
+        use crate::expressions::CastExpr;
+        let fixture = PartitioningTestFixture::new(vec![(
+            "ts",
+            DataType::Timestamp(TimeUnit::Nanosecond, None),
+        )])?;
+        let function = date_trunc_of(fixture.col(0), "hour", None);
+        let scalar_but_not_literal: Arc<dyn PhysicalExpr> = Arc::new(CastExpr::new(
+            Arc::new(Literal::new(ScalarValue::from("hour"))),
+            DataType::Utf8View,
+            None,
+        ));
+        let function =
+            function.with_new_children(vec![scalar_but_not_literal, fixture.col(0)])?;
+        let range = fixture.range_partitioning([0], vec![timestamp_split(Some(0), None)]);
+        assert_eq!(
+            range.satisfaction(
+                &Distribution::KeyPartitioned(vec![function]),
+                &fixture.eq_properties,
+                false,
+            ),
+            PartitioningSatisfaction::NotSatisfied
+        );
+        Ok(())
     }
 
     #[test]
