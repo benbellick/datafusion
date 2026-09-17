@@ -846,6 +846,11 @@ fn general_date_trunc(
         tz,
     )?;
 
+    let truncate_to = |value: i64, unit: i64| {
+        value
+            .checked_sub(value.rem_euclid(unit))
+            .ok_or_else(|| exec_datafusion_err!("Timestamp {value} out of range"))
+    };
     let result = match tu {
         Second => match granularity {
             DatePart::Minute => nano / 1_000_000_000 / 60 * 60,
@@ -859,14 +864,14 @@ fn general_date_trunc(
         Microsecond => match granularity {
             DatePart::Minute => nano / 1_000 / 1_000_000 / 60 * 60 * 1_000_000,
             DatePart::Second => nano / 1_000 / 1_000_000 * 1_000_000,
-            DatePart::Millisecond => nano / 1_000 / 1_000 * 1_000,
+            DatePart::Millisecond => truncate_to(nano / 1_000, 1_000)?,
             _ => nano / 1_000,
         },
         _ => match granularity {
             DatePart::Minute => nano / 1_000_000_000 / 60 * 1_000_000_000 * 60,
             DatePart::Second => nano / 1_000_000_000 * 1_000_000_000,
-            DatePart::Millisecond => nano / 1_000_000 * 1_000_000,
-            DatePart::Microsecond => nano / 1_000 * 1_000,
+            DatePart::Millisecond => truncate_to(nano, 1_000_000)?,
+            DatePart::Microsecond => truncate_to(nano, 1_000)?,
             _ => nano,
         },
     };
@@ -903,8 +908,8 @@ mod tests {
     use arrow::compute::DatePart;
     use arrow::compute::kernels::cast_utils::string_to_timestamp_nanos;
     use arrow::datatypes::{DataType, Field, IntervalUnit, TimeUnit};
-    use datafusion_common::ScalarValue;
     use datafusion_common::config::ConfigOptions;
+    use datafusion_common::{Result, ScalarValue};
     use datafusion_expr::{ColumnarValue, ScalarFunctionArgs, ScalarUDFImpl};
 
     #[test]
@@ -963,19 +968,17 @@ mod tests {
         timestamp: ColumnarValue,
         timestamp_type: DataType,
         number_rows: usize,
-    ) -> ColumnarValue {
-        DateTruncFunc::new()
-            .invoke_with_args(ScalarFunctionArgs {
-                args: vec![ScalarValue::from(granularity).into(), timestamp],
-                arg_fields: vec![
-                    Field::new("granularity", DataType::Utf8, false).into(),
-                    Field::new("timestamp", timestamp_type.clone(), true).into(),
-                ],
-                number_rows,
-                return_field: Field::new("date_trunc", timestamp_type, true).into(),
-                config_options: Arc::new(ConfigOptions::default()),
-            })
-            .unwrap()
+    ) -> Result<ColumnarValue> {
+        DateTruncFunc::new().invoke_with_args(ScalarFunctionArgs {
+            args: vec![ScalarValue::from(granularity).into(), timestamp],
+            arg_fields: vec![
+                Field::new("granularity", DataType::Utf8, false).into(),
+                Field::new("timestamp", timestamp_type.clone(), true).into(),
+            ],
+            number_rows,
+            return_field: Field::new("date_trunc", timestamp_type, true).into(),
+            config_options: Arc::new(ConfigOptions::default()),
+        })
     }
 
     fn assert_timezone_less_range_analysis_contract<T: ArrowTimestampType>() {
@@ -985,22 +988,41 @@ mod tests {
             TimeUnit::Microsecond => 1_000,
             TimeUnit::Nanosecond => 1,
         };
-        let values = [
-            Some("1969-12-28T23:59:59Z"),
-            Some("1969-12-31T23:59:59Z"),
-            Some("1970-01-01T00:00:00Z"),
-            Some("1999-12-31T23:59:59Z"),
-            Some("2000-01-01T00:00:00Z"),
-            Some("2000-02-28T23:59:59Z"),
-            Some("2000-02-29T00:00:00Z"),
-            Some("2000-03-01T00:00:00Z"),
-            Some("2023-12-31T23:59:59Z"),
-            Some("2024-01-01T00:00:00Z"),
-            None,
+        // Probe both sides of calendar and fixed-width boundaries at the
+        // input's own resolution, including negative fractional timestamps.
+        let mut timestamps = [
+            "1900-03-01T00:00:00Z", // Non-leap century.
+            "1969-12-29T00:00:00Z", // Monday before the epoch.
+            "1970-01-01T00:00:00Z",
+            "1970-01-01T00:00:00.000001Z",
+            "1970-01-01T00:00:00.001Z",
+            "1970-01-01T00:00:01Z",
+            "1970-01-01T00:01:00Z",
+            "1970-01-01T01:00:00Z",
+            "2000-01-01T00:00:00Z",
+            "2000-02-29T00:00:00Z", // Leap century.
+            "2000-03-01T00:00:00Z",
+            "2000-04-01T00:00:00Z", // Quarter boundary.
+            "2024-01-01T00:00:00Z", // Monday and year boundary.
         ]
-        .map(|value| {
-            value.map(|value| string_to_timestamp_nanos(value).unwrap() / scale)
-        });
+        .into_iter()
+        .flat_map(|value| {
+            let boundary = string_to_timestamp_nanos(value).unwrap() / scale;
+            [boundary - 1, boundary, boundary + 1]
+        })
+        .collect::<Vec<_>>();
+        // Stay inside the scalar nanosecond domain with room to truncate a
+        // full year at its lower edge; the upper edge needs no such margin.
+        timestamps.extend([
+            i64::MIN / scale + 366 * 86_400 * (1_000_000_000 / scale),
+            i64::MAX / scale,
+        ]);
+        timestamps.sort_unstable();
+        timestamps.dedup();
+        let values = timestamps
+            .into_iter()
+            .flat_map(|value| [Some(value), None])
+            .collect::<Vec<_>>();
         let timestamp_type = DataType::Timestamp(T::UNIT, None);
 
         for granularity in [
@@ -1015,13 +1037,14 @@ mod tests {
             "quarter",
             "year",
         ] {
-            let input = PrimitiveArray::<T>::from_iter(values);
+            let input = PrimitiveArray::<T>::from_iter(values.iter().copied());
             let output = invoke_date_trunc(
                 granularity,
                 ColumnarValue::Array(Arc::new(input.clone())),
                 timestamp_type.clone(),
                 input.len(),
-            );
+            )
+            .unwrap();
             let ColumnarValue::Array(output) = output else {
                 panic!("expected array output")
             };
@@ -1052,7 +1075,8 @@ mod tests {
                     ColumnarValue::Scalar(ScalarValue::new_timestamp::<T>(*value, None)),
                     timestamp_type.clone(),
                     1,
-                );
+                )
+                .unwrap();
                 let ColumnarValue::Scalar(scalar_output) = scalar_output else {
                     panic!("expected scalar output")
                 };
@@ -1072,6 +1096,64 @@ mod tests {
         assert_timezone_less_range_analysis_contract::<TimestampMillisecondType>();
         assert_timezone_less_range_analysis_contract::<TimestampMicrosecondType>();
         assert_timezone_less_range_analysis_contract::<TimestampNanosecondType>();
+    }
+
+    #[test]
+    fn range_analysis_distinguishes_errors_from_null_results() {
+        let timestamp_type = DataType::Timestamp(TimeUnit::Nanosecond, None);
+        for (precision, value) in [
+            ("microsecond", i64::MIN),
+            ("millisecond", i64::MIN),
+            ("hour", i64::MIN),
+            ("invalid", 0),
+        ] {
+            for input in [
+                ColumnarValue::Scalar(ScalarValue::TimestampNanosecond(
+                    Some(value),
+                    None,
+                )),
+                ColumnarValue::Array(Arc::new(TimestampNanosecondArray::from(vec![
+                    Some(value),
+                ]))),
+            ] {
+                assert!(
+                    invoke_date_trunc(precision, input, timestamp_type.clone(), 1)
+                        .is_err()
+                );
+            }
+        }
+
+        // The scalar path scales to nanoseconds, whereas the array fast path
+        // works in the original unit. A failed scalar boundary evaluation must
+        // decline optimization, not imply that array execution produces NULL.
+        let seconds = DataType::Timestamp(TimeUnit::Second, None);
+        assert!(
+            invoke_date_trunc(
+                "second",
+                ScalarValue::TimestampSecond(Some(i64::MAX), None).into(),
+                seconds.clone(),
+                1,
+            )
+            .is_err()
+        );
+        let output = invoke_date_trunc(
+            "second",
+            ColumnarValue::Array(Arc::new(TimestampSecondArray::from(vec![
+                Some(i64::MAX),
+                None,
+            ]))),
+            seconds,
+            2,
+        )
+        .unwrap();
+        let ColumnarValue::Array(output) = output else {
+            panic!("expected array")
+        };
+        assert_eq!(
+            ScalarValue::try_from_array(&output, 0).unwrap(),
+            ScalarValue::TimestampSecond(Some(i64::MAX), None)
+        );
+        assert!(output.is_null(1));
     }
 
     #[test]
