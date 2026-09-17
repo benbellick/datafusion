@@ -763,41 +763,10 @@ fn partial_aggregate_has_partition_local_groups(
         return true;
     }
 
-    let input_distribution =
-        Distribution::KeyPartitioned(aggregate.group_expr().input_exprs());
-    aggregate
-        .input()
-        .output_partitioning()
-        .satisfaction(
-            &input_distribution,
-            aggregate.input().equivalence_properties(),
-            allow_subset_satisfy_partitioning,
-        )
-        .is_key_local()
-}
-
-fn final_aggregate_accepts_partition_local_groups(
-    final_aggregate: &Arc<dyn ExecutionPlan>,
-    child: &Arc<dyn ExecutionPlan>,
-    allow_subset_satisfy_partitioning: bool,
-) -> bool {
-    let Some(final_aggregate) = final_aggregate.downcast_ref::<AggregateExec>() else {
-        return false;
-    };
-    let Some(partial_aggregate) = child.downcast_ref::<AggregateExec>() else {
-        return false;
-    };
-
-    final_aggregate.mode() == &AggregateMode::FinalPartitioned
-        && !final_aggregate.group_expr().has_grouping_set()
-        && physical_exprs_equal(
-            &partial_aggregate.output_group_expr(),
-            &final_aggregate.group_expr().input_exprs(),
-        )
-        && partial_aggregate_has_partition_local_groups(
-            child,
-            allow_subset_satisfy_partitioning,
-        )
+    aggregate.groups_are_partition_local(
+        aggregate.input().as_ref(),
+        allow_subset_satisfy_partitioning,
+    )
 }
 
 /// Adds a [`SortPreservingMergeExec`] or a [`CoalescePartitionsExec`] operator
@@ -1579,10 +1548,13 @@ pub fn ensure_distribution(
                                 .with_allow_subset(allow_subset_satisfy_partitioning),
                         )?
                         .is_satisfied()
-                        || final_aggregate_accepts_partition_local_groups(
-                            &plan,
-                            &child.plan,
-                            allow_subset_satisfy_partitioning,
+                        || plan.downcast_ref::<AggregateExec>().is_some_and(
+                            |aggregate| {
+                                aggregate.groups_are_partition_local(
+                                    child.plan.as_ref(),
+                                    allow_subset_satisfy_partitioning,
+                                )
+                            },
                         );
                     let preserve_satisfying_file_partitioning =
                         preserve_file_partition_threshold_met
