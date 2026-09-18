@@ -1243,6 +1243,36 @@ fn prev_value(value: ScalarValue) -> ScalarValue {
     value_transition!(MIN, false, value)
 }
 
+/// Returns the previous distinct value, or `None` for nulls, non-finite
+/// floats, type minima, and types without a discrete predecessor.
+pub fn checked_predecessor(value: &ScalarValue) -> Option<ScalarValue> {
+    if !is_finite_non_null(value) {
+        return None;
+    }
+
+    let predecessor = prev_value(value.clone());
+    (!predecessor.is_null() && predecessor != *value).then_some(predecessor)
+}
+
+/// Returns the next distinct value, or `None` for nulls, non-finite floats,
+/// type maxima, and types without a discrete successor.
+pub fn checked_successor(value: &ScalarValue) -> Option<ScalarValue> {
+    if !is_finite_non_null(value) {
+        return None;
+    }
+
+    let successor = next_value(value.clone());
+    (!successor.is_null() && successor != *value).then_some(successor)
+}
+
+fn is_finite_non_null(value: &ScalarValue) -> bool {
+    match value {
+        ScalarValue::Float32(Some(value)) => value.is_finite(),
+        ScalarValue::Float64(Some(value)) => value.is_finite(),
+        _ => !value.is_null(),
+    }
+}
+
 trait OneTrait: Sized + std::ops::Add + std::ops::Sub {
     fn one() -> Self;
 }
@@ -2261,7 +2291,8 @@ impl NullableInterval {
 mod tests {
     use crate::{
         interval_arithmetic::{
-            Interval, handle_overflow, next_value, prev_value, satisfy_greater,
+            Interval, checked_predecessor, checked_successor, handle_overflow,
+            next_value, prev_value, satisfy_greater,
         },
         operator::Operator,
     };
@@ -2356,6 +2387,71 @@ mod tests {
         });
 
         Ok(())
+    }
+
+    #[test]
+    fn test_checked_adjacent_values() {
+        let timestamp = ScalarValue::TimestampNanosecond(Some(10), None);
+        assert_eq!(
+            checked_predecessor(&timestamp),
+            Some(ScalarValue::TimestampNanosecond(Some(9), None))
+        );
+        assert_eq!(
+            checked_successor(&timestamp),
+            Some(ScalarValue::TimestampNanosecond(Some(11), None))
+        );
+
+        let timestamp_with_timezone =
+            ScalarValue::TimestampMillisecond(Some(10), Some("UTC".into()));
+        assert_eq!(
+            checked_predecessor(&timestamp_with_timezone),
+            Some(ScalarValue::TimestampMillisecond(
+                Some(9),
+                Some("UTC".into())
+            ))
+        );
+        assert_eq!(
+            checked_successor(&timestamp_with_timezone),
+            Some(ScalarValue::TimestampMillisecond(
+                Some(11),
+                Some("UTC".into())
+            ))
+        );
+
+        let finite_float = ScalarValue::Float64(Some(1.0));
+        assert_eq!(
+            checked_predecessor(&finite_float),
+            Some(ScalarValue::Float64(Some(next_down(1.0_f64))))
+        );
+        assert_eq!(
+            checked_successor(&finite_float),
+            Some(ScalarValue::Float64(Some(next_up(1.0_f64))))
+        );
+
+        assert_eq!(
+            checked_predecessor(&ScalarValue::TimestampNanosecond(Some(i64::MIN), None)),
+            None
+        );
+        assert_eq!(
+            checked_successor(&ScalarValue::TimestampNanosecond(Some(i64::MAX), None)),
+            None
+        );
+
+        let null = ScalarValue::TimestampNanosecond(None, None);
+        assert_eq!(checked_predecessor(&null), None);
+        assert_eq!(checked_successor(&null), None);
+        assert_eq!(
+            checked_predecessor(&ScalarValue::Float32(Some(f32::NEG_INFINITY))),
+            None
+        );
+        assert_eq!(
+            checked_successor(&ScalarValue::Float64(Some(f64::NAN))),
+            None
+        );
+
+        let unsupported = ScalarValue::Utf8(Some("a".into()));
+        assert_eq!(checked_predecessor(&unsupported), None);
+        assert_eq!(checked_successor(&unsupported), None);
     }
 
     #[test]
