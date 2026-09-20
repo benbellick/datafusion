@@ -1275,7 +1275,6 @@ mod tests {
         name: &'static str,
         field: &'static str,
         signature: Signature,
-        supports_range_partitioning_analysis: bool,
     }
     impl ScalarUDFImpl for TestScalarUDFImpl {
         fn name(&self) -> &str {
@@ -1292,14 +1291,6 @@ mod tests {
 
         fn invoke_with_args(&self, _args: ScalarFunctionArgs) -> Result<ColumnarValue> {
             unimplemented!()
-        }
-
-        fn supports_range_partitioning_analysis(
-            &self,
-            argument_types: &[DataType],
-        ) -> bool {
-            self.supports_range_partitioning_analysis
-                && argument_types == [DataType::Int64]
         }
     }
 
@@ -1335,17 +1326,9 @@ mod tests {
     }
 
     #[test]
-    fn aliases_preserve_range_partitioning_analysis_support() {
-        let function = ScalarUDF::from(TestScalarUDFImpl {
-            name: "range_function",
-            field: "a",
-            signature: Signature::any(1, Volatility::Immutable),
-            supports_range_partitioning_analysis: true,
-        })
-        .with_aliases(["range_function_alias"]);
-
-        assert!(function.supports_range_partitioning_analysis(&[DataType::Int64]));
-        assert!(!function.supports_range_partitioning_analysis(&[DataType::Utf8]));
+    fn range_partitioning_analysis_is_disabled_by_default() {
+        let function = test_func("range_function", "a");
+        assert!(!function.supports_range_partitioning_analysis(&[DataType::Int64]));
     }
 
     fn test_func(name: &'static str, parameter: &'static str) -> ScalarUDF {
@@ -1353,7 +1336,6 @@ mod tests {
             name,
             field: parameter,
             signature: Signature::any(1, Volatility::Immutable),
-            supports_range_partitioning_analysis: false,
         })
     }
 
