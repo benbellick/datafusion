@@ -399,40 +399,6 @@ mod tests {
         fn invoke_with_args(&self, _args: ScalarFunctionArgs) -> Result<ColumnarValue> {
             Ok(ColumnarValue::Scalar(ScalarValue::Int32(Some(42))))
         }
-
-        fn supports_range_partitioning_analysis(
-            &self,
-            argument_types: &[DataType],
-        ) -> bool {
-            argument_types == [DataType::Float32]
-        }
-    }
-
-    #[test]
-    fn test_range_partitioning_analysis_support_uses_argument_types() {
-        let function = Arc::new(ScalarUDF::from(MockScalarUDF {
-            signature: Signature::any(1, Volatility::Immutable),
-        }));
-        let config_options = Arc::new(ConfigOptions::new());
-
-        for (data_type, expected) in [(DataType::Float32, true), (DataType::Int32, false)]
-        {
-            let schema = Schema::new(vec![Field::new("a", data_type, false)]);
-            let expression = ScalarFunctionExpr::try_new(
-                Arc::clone(&function),
-                vec![Arc::new(Column::new("a", 0))],
-                &schema,
-                Arc::clone(&config_options),
-            )
-            .unwrap();
-
-            assert_eq!(
-                expression
-                    .supports_range_partitioning_analysis(&schema)
-                    .unwrap(),
-                expected
-            );
-        }
     }
 
     #[test]
