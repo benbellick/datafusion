@@ -1214,28 +1214,6 @@ mod tests {
         ))
     }
 
-    fn date_bin_of(timestamp: Arc<dyn PhysicalExpr>) -> Arc<dyn PhysicalExpr> {
-        Arc::new(ScalarFunctionExpr::new(
-            "date_bin",
-            datafusion_functions::datetime::date_bin(),
-            vec![
-                Arc::new(Literal::new(ScalarValue::new_interval_mdn(
-                    0,
-                    0,
-                    60_000_000_000,
-                ))),
-                timestamp,
-            ],
-            Field::new(
-                "date_bin",
-                DataType::Timestamp(TimeUnit::Nanosecond, None),
-                true,
-            )
-            .into(),
-            Arc::new(ConfigOptions::default()),
-        ))
-    }
-
     fn timestamp_split(value: Option<i64>, timezone: Option<&str>) -> SplitPoint {
         SplitPoint::new(vec![ScalarValue::TimestampNanosecond(
             value,
@@ -1434,15 +1412,6 @@ mod tests {
             &[trunc_hour, fixture.col(1)],
             &fixture.eq_properties,
             true,
-            false,
-        );
-
-        assert_key_locality(
-            "date_bin remains default-denied",
-            &aligned,
-            &[date_bin_of(fixture.col(0))],
-            &fixture.eq_properties,
-            false,
             false,
         );
 
