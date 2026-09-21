@@ -762,6 +762,20 @@ fn partial_aggregate_output_satisfies_final_partitioning(
         .is_satisfied()
 }
 
+fn partial_aggregate_input_keeps_groups_local(
+    plan: &Arc<dyn ExecutionPlan>,
+    allow_subset_satisfy_partitioning: bool,
+) -> bool {
+    plan.downcast_ref::<AggregateExec>()
+        .is_some_and(|aggregate| {
+            aggregate.mode() == &AggregateMode::Partial
+                && aggregate.groups_are_partition_local(
+                    aggregate.input().as_ref(),
+                    allow_subset_satisfy_partitioning,
+                )
+        })
+}
+
 /// Adds a [`SortPreservingMergeExec`] or a [`CoalescePartitionsExec`] operator
 /// on top of the given plan node to satisfy a single partition requirement
 /// while preserving ordering constraints.
@@ -1527,10 +1541,13 @@ pub fn ensure_distribution_with_stats(
 
             let preserve_partial_aggregate_partitioning =
                 preserve_file_partition_threshold_met
-                    && partial_aggregate_output_satisfies_final_partitioning(
+                    && (partial_aggregate_output_satisfies_final_partitioning(
                         &plan,
                         allow_subset_satisfy_partitioning,
-                    );
+                    ) || partial_aggregate_input_keeps_groups_local(
+                        &plan,
+                        allow_subset_satisfy_partitioning,
+                    ));
 
             let add_roundrobin = enable_round_robin
                 // Operator benefits from partitioning (e.g. filter):
@@ -1570,7 +1587,15 @@ pub fn ensure_distribution_with_stats(
                             ChildSatisfactionOptions::new()
                                 .with_allow_subset(allow_subset_satisfy_partitioning),
                         )?
-                        .is_satisfied();
+                        .is_satisfied()
+                        || plan.downcast_ref::<AggregateExec>().is_some_and(
+                            |aggregate| {
+                                aggregate.groups_are_partition_local(
+                                    child.plan.as_ref(),
+                                    allow_subset_satisfy_partitioning,
+                                )
+                            },
+                        );
                     let preserve_satisfying_file_partitioning =
                         preserve_file_partition_threshold_met
                             && !requires_grouping_id
