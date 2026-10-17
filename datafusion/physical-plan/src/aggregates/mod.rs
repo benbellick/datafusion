@@ -1659,7 +1659,7 @@ impl AggregateExec {
     /// local. A final stage can inherit that guarantee from a partial stage
     /// even when projecting the grouping expressions loses range metadata.
     /// This check does not require the two stages to be combined.
-    pub fn groups_are_partition_local(
+    pub fn input_keeps_groups_local(
         &self,
         input: &dyn ExecutionPlan,
         allow_subset: bool,
@@ -1692,7 +1692,7 @@ impl AggregateExec {
                             &partial.output_group_expr(),
                             &self.group_by().input_exprs(),
                         )
-                        && partial.groups_are_partition_local(
+                        && partial.input_keeps_groups_local(
                             partial.input.as_ref(),
                             allow_subset,
                         )
