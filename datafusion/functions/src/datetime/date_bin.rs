@@ -289,6 +289,25 @@ impl ScalarUDFImpl for DateBinFunc {
         }
     }
 
+    fn supports_range_key_locality_analysis_with_args(
+        &self,
+        argument_types: &[DataType],
+        literal_arguments: &[Option<&ScalarValue>],
+    ) -> bool {
+        // With the epoch origin, a positive nanosecond stride rounds down
+        // monotonically. Timestamp binning preserves NULLs or returns an error.
+        match (argument_types, literal_arguments) {
+            (
+                [
+                    DataType::Interval(MonthDayNano),
+                    Timestamp(Nanosecond, None),
+                ],
+                [Some(ScalarValue::IntervalMonthDayNano(Some(stride))), None],
+            ) => stride.months == 0 && stride.days == 0 && stride.nanoseconds > 0,
+            _ => false,
+        }
+    }
+
     fn documentation(&self) -> Option<&Documentation> {
         self.doc()
     }
@@ -989,6 +1008,135 @@ mod tests {
             err.strip_backtrace().contains("overflows i64"),
             "unexpected error: {err}"
         );
+    }
+
+    #[test]
+    fn range_key_locality_requires_positive_nanosecond_only_stride() {
+        use arrow::datatypes::DataType::Timestamp;
+        use arrow::datatypes::TimeUnit::Nanosecond;
+
+        let function = DateBinFunc::new();
+        let timestamp_type = Timestamp(Nanosecond, None);
+        let cases = [
+            (
+                "one nanosecond",
+                ScalarValue::new_interval_mdn(0, 0, 1),
+                true,
+            ),
+            (
+                "one hour",
+                ScalarValue::new_interval_mdn(0, 0, 3_600_000_000_000),
+                true,
+            ),
+            (
+                "largest nanosecond stride",
+                ScalarValue::new_interval_mdn(0, 0, i64::MAX),
+                true,
+            ),
+            (
+                "NULL stride",
+                ScalarValue::IntervalMonthDayNano(None),
+                false,
+            ),
+            ("zero stride", ScalarValue::new_interval_mdn(0, 0, 0), false),
+            (
+                "negative stride",
+                ScalarValue::new_interval_mdn(0, 0, -1),
+                false,
+            ),
+            (
+                "month stride",
+                ScalarValue::new_interval_mdn(1, 0, 0),
+                false,
+            ),
+            ("day stride", ScalarValue::new_interval_mdn(0, 1, 0), false),
+            (
+                "mixed stride",
+                ScalarValue::new_interval_mdn(0, 1, 1),
+                false,
+            ),
+            (
+                "day-time stride",
+                ScalarValue::new_interval_dt(0, 1000),
+                false,
+            ),
+        ];
+        for (description, stride, expected) in cases {
+            assert_eq!(
+                function.supports_range_key_locality_analysis_with_args(
+                    &[stride.data_type(), timestamp_type.clone()],
+                    &[Some(&stride), None],
+                ),
+                expected,
+                "{description}",
+            );
+        }
+    }
+
+    #[test]
+    fn range_key_locality_rejects_unsupported_source_types() {
+        use arrow::datatypes::DataType::{Time64, Timestamp};
+        use arrow::datatypes::TimeUnit::{Microsecond, Millisecond, Nanosecond, Second};
+
+        let function = DateBinFunc::new();
+        let stride = ScalarValue::new_interval_mdn(0, 0, 3_600_000_000_000);
+        for source_type in [
+            Timestamp(Second, None),
+            Timestamp(Millisecond, None),
+            Timestamp(Microsecond, None),
+            Timestamp(Nanosecond, Some("UTC".into())),
+            Time64(Nanosecond),
+        ] {
+            assert!(
+                !function.supports_range_key_locality_analysis_with_args(
+                    &[stride.data_type(), source_type.clone()],
+                    &[Some(&stride), None],
+                ),
+                "source type {source_type:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn range_key_locality_requires_literal_argument_values() {
+        use arrow::datatypes::IntervalUnit::MonthDayNano;
+
+        let function = DateBinFunc::new();
+        let argument_types = [
+            DataType::Interval(MonthDayNano),
+            DataType::Timestamp(TimeUnit::Nanosecond, None),
+        ];
+        assert!(!function.supports_range_key_locality_analysis(&argument_types));
+    }
+
+    #[test]
+    fn range_key_locality_rejects_non_literal_stride() {
+        use arrow::datatypes::IntervalUnit::MonthDayNano;
+
+        let function = DateBinFunc::new();
+        let argument_types = [
+            DataType::Interval(MonthDayNano),
+            DataType::Timestamp(TimeUnit::Nanosecond, None),
+        ];
+        assert!(!function.supports_range_key_locality_analysis_with_args(
+            &argument_types,
+            &[None, None],
+        ));
+    }
+
+    #[test]
+    fn range_key_locality_rejects_explicit_origin() {
+        let function = DateBinFunc::new();
+        let stride = ScalarValue::new_interval_mdn(0, 0, 3_600_000_000_000);
+        let epoch = ScalarValue::TimestampNanosecond(Some(0), None);
+        assert!(!function.supports_range_key_locality_analysis_with_args(
+            &[
+                stride.data_type(),
+                DataType::Timestamp(TimeUnit::Nanosecond, None),
+                epoch.data_type(),
+            ],
+            &[Some(&stride), None, Some(&epoch)],
+        ));
     }
 
     #[test]
